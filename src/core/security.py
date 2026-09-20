@@ -10,7 +10,6 @@ import re
 import threading
 import time
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import Request
@@ -63,14 +62,15 @@ def validate_pdf_magic_bytes(pdf_bytes: bytes) -> None:
 def sanitize_filename(raw_filename: str | None) -> str:
     """Sanitiza el nombre del archivo para neutralizar ataques de Path Traversal e Inyecciones.
 
-    Extrae únicamente el nombre base (sin directorios ni rutas relativas),
+    Extrae únicamente el nombre base (sin directorios ni rutas relativas Unix o Windows),
     remueve caracteres de control y normaliza a caracteres seguros.
     """
     if not raw_filename or not raw_filename.strip():
         return "document.pdf"
 
-    # 1. Extraer nombre base descartando rutas Unix y Windows (../, ..\)
-    base_name = Path(raw_filename).name
+    # 1. Normalizar separadores de ruta Unix y Windows (/ y \) y eliminar barras finales
+    normalized = raw_filename.replace("\\", "/").rstrip("/")
+    base_name = normalized.rsplit("/", 1)[-1] if normalized else ""
 
     # 2. Filtrar caracteres no seguros (mantener alfanuméricos, guiones, puntos y guiones bajos)
     clean_name = re.sub(r"[^\w\.\-\s]", "_", base_name, flags=re.ASCII)
