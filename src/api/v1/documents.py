@@ -5,8 +5,9 @@ import logging
 import time
 import uuid
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, File, HTTPException, Request, Response, UploadFile, status
 
+from src.core.cache import document_cache
 from src.core.config import settings
 from src.core.security import (
     InvalidPDFMagicBytesError,
@@ -17,6 +18,7 @@ from src.core.security import (
     sanitize_filename,
     validate_pdf_magic_bytes,
 )
+from src.core.telemetry import telemetry_registry
 from src.schemas.api_response import (
     DocumentProcessResponse,
     ProcessingMetrics,
@@ -55,6 +57,7 @@ router = APIRouter()
 )
 async def process_document(
     request: Request,
+    response: Response,
     file: UploadFile = File(..., description="Archivo PDF a procesar (máximo 10 páginas)"),
 ) -> DocumentProcessResponse:
     """Orquestador de procesamiento de extremo a extremo con hardening de seguridad."""
@@ -125,7 +128,29 @@ async def process_document(
             detail=str(exc),
         ) from exc
 
-    # 6. Pipeline de Ejecución con Control de Concurrencia (Anti-OOM) y Timeout Estricto
+    # 6. Verificación en Caché Idempotente en RAM (SHA-256)
+    cache_key = document_cache.compute_cache_key(
+        pdf_bytes=pdf_bytes,
+        model_name=settings.OPENAI_MODEL,
+        dpi=settings.PDF_RENDER_DPI,
+    )
+
+    cached_response = document_cache.get(cache_key)
+    if cached_response is not None:
+        telemetry_registry.record_cache_hit()
+        response.headers["X-Cache-Status"] = "HIT"
+        elapsed_time = time.perf_counter() - start_time
+        result_copy = cached_response.model_copy(deep=True)
+        result_copy.metrics.duration_seconds = round(elapsed_time, 4)
+        result_copy.message = f"Documento '{filename}' recuperado desde la caché idempotente (sin consumo de cuota LLM)."
+        telemetry_registry.record_document_processed(result_copy.metrics.total_pages_processed)
+        logger.info("Respuesta servida desde caché idempotente para '%s' en %.4fs", filename, elapsed_time)
+        return result_copy
+
+    telemetry_registry.record_cache_miss()
+    response.headers["X-Cache-Status"] = "MISS"
+
+    # 7. Pipeline de Ejecución con Control de Concurrencia (Anti-OOM) y Timeout Estricto
     async def _execute_analysis():
         # A. Rasterización con pypdfium2 (Zero Disk I/O)
         pdf_converter = PDFConverterService()
@@ -226,9 +251,14 @@ async def process_document(
         total_pages,
     )
 
-    return DocumentProcessResponse(
+    final_response = DocumentProcessResponse(
         status=ProcessingStatus.SUCCESS,
         message=f"Documento '{filename}' analizado y estructurado con éxito.",
         data=unified_result,
         metrics=metrics,
     )
+
+    telemetry_registry.record_document_processed(total_pages)
+    document_cache.set(cache_key, final_response)
+
+    return final_response

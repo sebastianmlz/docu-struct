@@ -15,6 +15,7 @@ from typing import AsyncIterator
 from fastapi import Request
 
 from src.core.config import settings
+from src.core.telemetry import telemetry_registry
 
 logger = logging.getLogger("docustruct.core.security")
 
@@ -130,6 +131,7 @@ class InMemoryRateLimiter:
                 oldest = valid_timestamps[0]
                 retry_after = max(1, int(window_seconds - (now - oldest)))
                 self._requests[key] = valid_timestamps
+                telemetry_registry.record_ratelimit_rejection()
                 return False, retry_after
 
             # Registrar la petición actual
@@ -157,20 +159,22 @@ rate_limiter = InMemoryRateLimiter()
 
 
 # =====================================================================
-# Control de Concurrencia en Memoria (Blindaje Anti-OOM)
+# Control de Concurrencia en Memoria (Blindaje Anti-OOM y Graceful Shutdown)
 # =====================================================================
 
 
 class ConcurrencyGuard:
     """Guardián de concurrencia basado en asyncio.Semaphore para proteger la memoria RAM del VPS.
 
-    Garantiza que no se procesen más documentos simultáneos de los permitidos por MAX_CONCURRENT_JOBS.
+    Garantiza que no se procesen más documentos simultáneos de los permitidos por MAX_CONCURRENT_JOBS
+    y soporta drenado ordenado durante el apagado (graceful shutdown).
     """
 
     def __init__(self, max_slots: int | None = None) -> None:
         self._max_slots = max_slots or settings.MAX_CONCURRENT_JOBS
         self._semaphore: asyncio.Semaphore | None = None
         self._active_count = 0
+        self._is_shutting_down = False
         self._lock = asyncio.Lock()
 
     def _get_semaphore(self) -> asyncio.Semaphore:
@@ -181,10 +185,17 @@ class ConcurrencyGuard:
     @asynccontextmanager
     async def acquire_slot(self) -> AsyncIterator[None]:
         """Adquiere una ranura de procesamiento de forma no bloqueante o con rechazo inmediato si está saturado."""
+        if self._is_shutting_down:
+            telemetry_registry.record_concurrency_rejection()
+            raise ServerCapacityExceededError(
+                "El servidor está en proceso de apagado ordenado. No se aceptan nuevos documentos."
+            )
+
         sem = self._get_semaphore()
 
         # Intentar adquirir inmediatamente la ranura de memoria
         if sem.locked():
+            telemetry_registry.record_concurrency_rejection()
             logger.warning(
                 "Capacidad máxima de procesamiento alcanzada (%d ranuras ocupadas). Aplicando backpressure.",
                 self._max_slots,
@@ -197,6 +208,7 @@ class ConcurrencyGuard:
         await sem.acquire()
         async with self._lock:
             self._active_count += 1
+            telemetry_registry.set_active_concurrency(self._active_count)
             logger.info("Ranura de procesamiento adquirida. Trabajos activos: %d/%d", self._active_count, self._max_slots)
 
         try:
@@ -205,11 +217,34 @@ class ConcurrencyGuard:
             sem.release()
             async with self._lock:
                 self._active_count = max(0, self._active_count - 1)
+                telemetry_registry.set_active_concurrency(self._active_count)
                 logger.info("Ranura de procesamiento liberada. Trabajos activos: %d/%d", self._active_count, self._max_slots)
+
+    async def drain(self, timeout_seconds: float = 15.0) -> bool:
+        """Detiene la aceptación de nuevos trabajos y espera a que los trabajos en curso finalicen."""
+        self._is_shutting_down = True
+        logger.info("Iniciando drenado de trabajos concurrentes para apagado ordenado. Timeout: %.1fs", timeout_seconds)
+        start = time.time()
+        while self._active_count > 0 and (time.time() - start) < timeout_seconds:
+            await asyncio.sleep(0.25)
+
+        if self._active_count == 0:
+            logger.info("Drenado completado exitosamente. Cero trabajos activos en memoria.")
+            return True
+
+        logger.warning(
+            "Tiempo de drenado expirado. Cerrando con %d trabajos aún en vuelo.",
+            self._active_count,
+        )
+        return False
 
     @property
     def active_jobs(self) -> int:
         return self._active_count
+
+    @property
+    def is_shutting_down(self) -> bool:
+        return self._is_shutting_down
 
 
 # Instancia singleton del guardián de concurrencia

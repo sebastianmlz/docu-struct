@@ -23,28 +23,31 @@ docu-struct/
 │   ├── ci.yml                 # Lint (Ruff), seguridad AST (Bandit), Pytest (3.10/3.11), smoke test Docker
 │   └── cd.yml                 # Buildx, escaneo de vulnerabilidades Trivy y publicacion en GHCR
 ├── src/
-│   ├── main.py                # Entrypoint ASGI FastAPI, middleware de cabeceras de seguridad y CORS
+│   ├── main.py                # Entrypoint ASGI FastAPI, middleware X-Request-ID, telemetria y CSP
 │   ├── core/
 │   │   ├── config.py          # Configuracion Pydantic Settings (Twelve-Factor, SecretStr)
-│   │   └── logging.py         # Logging estructurado del sistema
+│   │   ├── logging.py         # Logging estructurado JSON y correlacion con request_id
+│   │   ├── cache.py           # Cache idempotente en RAM indexada por SHA-256 (LRU + TTL)
+│   │   ├── telemetry.py       # Registro de metricas en memoria y exportador Prometheus
+│   │   └── security.py        # Magic bytes, rate limiter, concurrency guard y graceful shutdown
 │   ├── schemas/
 │   │   ├── document.py        # Modelos Pydantic v2: PageExtraction, TablePayload, DocumentBlock
 │   │   └── api_response.py    # Envelope estandar de respuesta HTTP y metricas de ejecucion
 │   ├── services/
 │   │   ├── pdf_converter.py   # Rasterizador de PDF a PNG en memoria (pypdfium2)
-│   │   ├── vision_extractor.py# Cadena multimodal LCEL con soporte para Gemini y OpenAI
+│   │   ├── vision_extractor.py# Cadena multimodal LCEL con reintentos exponenciales y jitter
 │   │   └── postprocessor.py   # Motor algoritmico de union de tablas y deduplicacion
 │   ├── api/
 │   │   ├── router.py          # Enrutador central y endpoint /api/v1/health
 │   │   └── v1/
-│   │       └── documents.py   # Endpoint POST /api/v1/documents/process
+│   │       └── documents.py   # Endpoint POST /api/v1/documents/process con verificacion de cache
 │   ├── web/
 │   │   ├── router.py          # Ruta GET / para la interfaz web
 │   │   ├── templates/         # Plantilla Jinja2 con diseno forense e iconos vectoriales SVG
 │   │   └── static/            # Cliente JavaScript nativo ES6 (sin dependencias Node.js)
 │   └── utils/
 │       └── image_utils.py     # Utilidades de codificacion Base64 y optimizacion de imagen
-├── tests/                     # Suite de 51 pruebas automatizadas (unitarias, integracion, seguridad)
+├── tests/                     # Suite de 81 pruebas automatizadas (unitarias, integracion, resiliencia)
 ├── Dockerfile                 # Imagen multi-stage de produccion con usuario no-root (appuser)
 ├── docker-compose.yml         # Orquestacion de contenedor con limites de CPU y memoria
 ├── pyproject.toml             # Configuracion de Ruff, Pytest y Coverage
@@ -206,6 +209,14 @@ El repositorio incluye dos flujos automatizados de integracion y entrega continu
 ### Diagnostico de Salud
 - **Metodo:** `GET /api/v1/health`
 - **Respuesta (200 OK):** Estado operativo, version, proveedor activo, modelo LLM y limites configurados.
+
+### Metricas y Telemetria Prometheus
+- **Metodo:** `GET /metrics`
+- **Respuesta (200 OK):** Texto plano compatible con Prometheus (v0.0.4) con contadores de peticiones, aciertos de cache, medidores de concurrencia y distribucion de latencia.
+
+### Telemetria Operacional JSON
+- **Metodo:** `GET /api/v1/telemetry`
+- **Respuesta (200 OK):** Resumen de estado operativo en formato JSON (uptime, concurrencia activa, ratio de aciertos de cache y peticiones).
 
 ---
 

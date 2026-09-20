@@ -108,6 +108,44 @@ class Settings(BaseSettings):
         description="Activar Content-Security-Policy estricta en las cabeceras HTTP.",
     )
 
+    # Observabilidad y Logging Estructurado
+    JSON_LOGS_ENABLED: bool = Field(
+        default=False,
+        description="Activar salida de logs en formato JSON estructurado para entornos de producción/VPS.",
+    )
+
+    # Caché Idempotente en Memoria (RAM)
+    CACHE_ENABLED: bool = Field(
+        default=True,
+        description="Activar caché en memoria por hash SHA-256 para evitar reprocesamiento y consumo duplicado de LLM.",
+    )
+    CACHE_MAX_ENTRIES: int = Field(
+        default=50,
+        ge=5,
+        le=500,
+        description="Número máximo de documentos extraídos retenidos simultáneamente en memoria (LRU).",
+    )
+    CACHE_TTL_SECONDS: int = Field(
+        default=3600,
+        ge=60,
+        le=86400,
+        description="Tiempo de vida en segundos para las entradas en caché antes de expiración (1 hora por defecto).",
+    )
+
+    # Telemetría y Métricas (Formato Prometheus)
+    METRICS_ENABLED: bool = Field(
+        default=True,
+        description="Habilitar endpoint /metrics en formato texto plano estándar de Prometheus.",
+    )
+
+    # Parada Ordenada (Graceful Shutdown)
+    GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: int = Field(
+        default=15,
+        ge=1,
+        le=60,
+        description="Tiempo máximo de espera en segundos para que los trabajos en vuelo finalicen antes del cierre.",
+    )
+
     @property
     def max_upload_size_bytes(self) -> int:
         """Devuelve el límite de subida en bytes para validación temprana en FastAPI."""

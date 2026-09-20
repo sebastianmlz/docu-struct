@@ -1,16 +1,18 @@
-"""Main FastAPI application entrypoint and lifespan management."""
-
 import logging
+import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from src.api.router import api_router
 from src.core.config import settings
-from src.core.logging import setup_logging
+from src.core.logging import set_request_id, setup_logging
+from src.core.security import concurrency_guard
+from src.core.telemetry import telemetry_registry
 from src.web.router import web_router
 
 logger = logging.getLogger("docustruct.main")
@@ -21,13 +23,15 @@ STATIC_DIR = BASE_DIR / "web" / "static"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Ciclo de vida de la aplicación: configuración al arranque y cierre."""
+    """Ciclo de vida de la aplicación: configuración al arranque y cierre ordenado (graceful shutdown)."""
     setup_logging()
     logger.info("=========================================================")
     logger.info("Iniciando %s (v%s)", settings.PROJECT_NAME, settings.VERSION)
     logger.info("Modelo LLM Activo: %s", settings.OPENAI_MODEL)
     logger.info("Límites: Máx %d págs, %d MB", settings.MAX_PAGES_PER_DOCUMENT, settings.MAX_UPLOAD_SIZE_MB)
     logger.info("DPI de Renderizado: %d DPI", settings.PDF_RENDER_DPI)
+    logger.info("Caché Idempotente: %s (Max: %d docs, TTL: %ds)", settings.CACHE_ENABLED, settings.CACHE_MAX_ENTRIES, settings.CACHE_TTL_SECONDS)
+    logger.info("Métricas Prometheus: %s (/metrics)", settings.METRICS_ENABLED)
     if settings.is_gemini_configured:
         logger.info("API Key de Google Gemini: Configurada [OK]")
     if settings.is_openai_configured:
@@ -38,7 +42,9 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    logger.info("Cerrando %s. Liberando recursos.", settings.PROJECT_NAME)
+    logger.info("Iniciando apagado ordenado (graceful shutdown) de %s...", settings.PROJECT_NAME)
+    await concurrency_guard.drain(timeout_seconds=float(settings.GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS))
+    logger.info("Cierre completado. Recursos liberados con éxito.")
 
 
 app = FastAPI(
@@ -49,6 +55,33 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+
+# ------------------------------------------------------------------------------
+# Observabilidad: Trazabilidad por Request-ID y Telemetría
+# ------------------------------------------------------------------------------
+@app.middleware("http")
+async def telemetry_and_request_id_middleware(request: Request, call_next):
+    """Correlaciona cada petición con un X-Request-ID unívoco y mide la latencia para métricas."""
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    set_request_id(request_id)
+    start_time = time.perf_counter()
+
+    try:
+        response: Response = await call_next(request)
+    finally:
+        duration = time.perf_counter() - start_time
+        # Si la respuesta existe, registrar en telemetría; si falló antes de responder, registrar 500
+        status_code = getattr(locals().get("response"), "status_code", 500)
+        telemetry_registry.record_request(
+            method=request.method,
+            endpoint=request.url.path,
+            status_code=status_code,
+            duration_seconds=duration,
+        )
+
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
 # ------------------------------------------------------------------------------
@@ -98,6 +131,33 @@ if STATIC_DIR.exists():
 # Montaje de rutas web y rutas API
 app.include_router(web_router)
 app.include_router(api_router)
+
+
+# ------------------------------------------------------------------------------
+# Endpoints de Telemetría y Métricas (Prometheus & JSON)
+# ------------------------------------------------------------------------------
+@app.get(
+    "/metrics",
+    response_class=Response,
+    summary="Métricas de observabilidad en formato estándar Prometheus (v0.0.4)",
+    tags=["Telemetría"],
+)
+async def prometheus_metrics():
+    """Exporta métricas operacionales de concurrencia, peticiones, latencia y caché para Prometheus."""
+    if not settings.METRICS_ENABLED:
+        return Response(content="Métricas deshabilitadas.\n", status_code=404, media_type="text/plain")
+    exposition = telemetry_registry.generate_prometheus_exposition()
+    return Response(content=exposition, media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
+@app.get(
+    "/api/v1/telemetry",
+    summary="Resumen operacional en formato JSON",
+    tags=["Telemetría"],
+)
+async def json_telemetry():
+    """Retorna estado y estadísticas operacionales en formato JSON."""
+    return telemetry_registry.to_json()
 
 
 if __name__ == "__main__":

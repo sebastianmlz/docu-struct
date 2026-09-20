@@ -4,7 +4,9 @@ Implements declarative, deterministic chains with strict JSON Schema output cont
 rigorous prompt engineering for edge cases, and prompt-injection defense.
 """
 
+import asyncio
 import logging
+import random
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -14,6 +16,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from src.core.config import settings
+from src.core.telemetry import telemetry_registry
 from src.schemas.document import (
     CENSORED_SENTINEL,
     PageExtraction,
@@ -244,10 +247,9 @@ class VisionExtractorService:
         page_number: int,
         total_pages: int,
         context: PreviousPageContext | None = None,
+        max_attempts: int = 4,
     ) -> PageExtraction:
         """Ejecuta de forma asíncrona la extracción visual estructurada de una página con reintentos automáticos."""
-        max_attempts = 4
-
         for attempt in range(1, max_attempts + 1):
             try:
                 logger.info(
@@ -291,18 +293,22 @@ class VisionExtractorService:
                 err_str = str(exc).lower()
                 is_transient = any(
                     term in err_str
-                    for term in ("503", "unavailable", "demand", "429", "rate", "overload", "timeout")
+                    for term in ("503", "unavailable", "demand", "429", "rate", "overload", "timeout", "resource_exhausted")
                 )
 
                 if is_transient and attempt < max_attempts:
-                    backoff = attempt * 2.5
+                    telemetry_registry.record_model_retry()
+                    base_backoff = attempt * 2.0
+                    jitter = random.uniform(0.75, 1.25)  # nosec B311
+                    backoff = round(base_backoff * jitter, 2)
                     logger.warning(
-                        "Respuesta transitoria del proveedor de IA en página %d (%s). Reintentando en %.1fs...",
+                        "Respuesta transitoria del proveedor de IA en página %d (%s). Reintento %d/%d con jitter en %.2fs...",
                         page_number,
                         exc,
+                        attempt,
+                        max_attempts,
                         backoff,
                     )
-                    import asyncio
                     await asyncio.sleep(backoff)
                     continue
 
