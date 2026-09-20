@@ -104,11 +104,27 @@ jobs:
             -p 8000:8000 \
             -e GEMINI_API_KEY="ci_smoke_key" \
             docustruct:ci-test
+          sleep 3
 
       - name: Validate Healthcheck Endpoint
         run: |
-          echo "Waiting for container startup..."
-          curl --retry 8 --retry-connrefused --retry-delay 2 -f http://127.0.0.1:8000/api/v1/health
+          echo "Probing container health endpoint..."
+          READY=0
+          for i in {1..20}; do
+            if curl -s -f http://127.0.0.1:8000/api/v1/health; then
+              echo ""
+              echo "Container health check passed successfully!"
+              READY=1
+              break
+            fi
+            echo "Attempt $i/20: container is booting. Retrying in 2s..."
+            sleep 2
+          done
+
+          if [ $READY -ne 1 ]; then
+            echo "Container health check timed out."
+            exit 1
+          fi
 
       - name: Inspect Container Logs & Clean Up
         if: always()
