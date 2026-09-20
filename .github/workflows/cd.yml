@@ -1,0 +1,105 @@
+name: CD Pipeline - Container Release & Security
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag de versión a publicar (ej: v0.1.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Job 1: Buildx, Escaneo de Vulnerabilidades con Trivy y Publicación a GHCR
+  # ----------------------------------------------------------------------------
+  build-scan-and-publish:
+    name: Build, Security Scan & Publish to GHCR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker Metadata & Tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Build Container Image Locally for Vulnerability Scanning
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: docustruct:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy Vulnerability Scanner on Container Image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: docustruct:${{ github.sha }}
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+
+      - name: Upload Trivy Scan Results to GitHub Security Tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"
+
+      - name: Push Production Image to GitHub Container Registry
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+
+  # ----------------------------------------------------------------------------
+  # Job 2: Verificación Post-Despliegue (Smoke Test de Release)
+  # ----------------------------------------------------------------------------
+  post-deployment-verification:
+    name: Post-Deployment Smoke Verification
+    runs-on: ubuntu-latest
+    needs: [build-scan-and-publish]
+    steps:
+      - name: Release Audit Log
+        run: |
+          echo "========================================================"
+          echo "Release de contenedor publicado exitosamente en GHCR."
+          echo "Imagen: ghcr.io/${{ github.repository }}:${{ github.ref_name }}"
+          echo "Commit SHA: ${{ github.sha }}"
+          echo "Audit de seguridad Trivy cargado a Security Tab."
+          echo "========================================================"

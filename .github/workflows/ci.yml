@@ -1,0 +1,118 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Job 1: Linting, Formatting y Auditoría Estática de Seguridad
+  # ----------------------------------------------------------------------------
+  lint-and-security:
+    name: Code Quality & Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Linting & Security Tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff bandit
+
+      - name: Check Code Style & Linting with Ruff
+        run: |
+          ruff check src/ tests/
+
+      - name: AST Security Vulnerability Scan with Bandit
+        run: |
+          bandit -r src/ -ll --exclude ./tests
+
+  # ----------------------------------------------------------------------------
+  # Job 2: Suite Completa de Tests Automatizados con Cobertura
+  # ----------------------------------------------------------------------------
+  test-suite:
+    name: Automated Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: [lint-and-security]
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install Project Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Execute Pytest Suite with Coverage
+        run: |
+          pytest -v --cov=src --cov-report=term-missing --cov-report=xml tests/
+
+      - name: Upload Coverage Artifact (Python 3.10 only)
+        if: matrix.python-version == '3.10'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 14
+
+  # ----------------------------------------------------------------------------
+  # Job 3: Docker Build & Container Smoke Test
+  # ----------------------------------------------------------------------------
+  docker-smoke-test:
+    name: Docker Build & Health Smoke Test
+    runs-on: ubuntu-latest
+    needs: [test-suite]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker Container Image
+        run: |
+          docker build -t docustruct:ci-test .
+
+      - name: Start Ephemeral Container
+        run: |
+          docker run -d \
+            --name docustruct-smoke \
+            -p 8000:8000 \
+            -e GEMINI_API_KEY="ci_smoke_key" \
+            docustruct:ci-test
+
+      - name: Validate Healthcheck Endpoint
+        run: |
+          echo "Waiting for container startup..."
+          curl --retry 8 --retry-connrefused --retry-delay 2 -f http://127.0.0.1:8000/api/v1/health
+
+      - name: Inspect Container Logs & Clean Up
+        if: always()
+        run: |
+          docker logs docustruct-smoke
+          docker stop docustruct-smoke || true
+          docker rm docustruct-smoke || true
