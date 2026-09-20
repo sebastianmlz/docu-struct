@@ -77,6 +77,36 @@ class Settings(BaseSettings):
         le=300,
         description="Resolución de rasterizado. 150 DPI ofrece equilibrio óptimo entre tokens y OCR.",
     )
+    MAX_PAGE_DIMENSION_POINTS: int = Field(
+        default=5000,
+        ge=500,
+        le=15000,
+        description="Dimensión máxima en puntos por página para neutralizar bombas de píxeles.",
+    )
+
+    # Hardening y Control de Recursos (Autónomo para Local/VPS)
+    MAX_CONCURRENT_JOBS: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description="Máximo de documentos procesados simultáneamente para blindar la memoria RAM.",
+    )
+    RATE_LIMIT_PROCESS_PER_MINUTE: int = Field(
+        default=10,
+        ge=1,
+        le=120,
+        description="Límite de solicitudes de procesamiento por minuto por IP.",
+    )
+    DOCUMENT_TIMEOUT_SECONDS: int = Field(
+        default=120,
+        ge=10,
+        le=600,
+        description="Límite de tiempo máximo en segundos para procesar un documento antes de timeout.",
+    )
+    STRICT_CSP_ENABLED: bool = Field(
+        default=True,
+        description="Activar Content-Security-Policy estricta en las cabeceras HTTP.",
+    )
 
     @property
     def max_upload_size_bytes(self) -> int:

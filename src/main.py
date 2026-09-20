@@ -56,13 +56,27 @@ app = FastAPI(
 # ------------------------------------------------------------------------------
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
-    """Inyecta cabeceras defensivas contra sniffing, clickjacking y XSS."""
+    """Inyecta cabeceras defensivas contra sniffing, clickjacking, inyecciones y fugas de contexto."""
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["X-Permitted-Cross-Domain-Policies"] = "none"
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
+
+    if settings.STRICT_CSP_ENABLED:
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; "
+            "style-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; "
+            "img-src 'self' data:; "
+            "connect-src 'self'; "
+            "font-src 'self'; "
+            "frame-ancestors 'none';"
+        )
     return response
 
 

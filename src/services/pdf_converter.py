@@ -27,6 +27,10 @@ class EmptyPDFError(PDFProcessingError):
     """Lanzada cuando el documento no contiene páginas procesables."""
 
 
+class PageDimensionExceededError(PDFProcessingError):
+    """Lanzada cuando las dimensiones de una página exceden los límites seguros."""
+
+
 class RenderedPage(BaseModel):
     """Representación en memoria de una página renderizada."""
 
@@ -94,6 +98,13 @@ class PDFConverterService:
                 page = None
                 try:
                     page = pdf_doc.get_page(page_index)
+                    w_pts, h_pts = page.get_size()
+                    if w_pts > settings.MAX_PAGE_DIMENSION_POINTS or h_pts > settings.MAX_PAGE_DIMENSION_POINTS:
+                        raise PageDimensionExceededError(
+                            f"La página {page_index + 1} excede las dimensiones máximas permitidas "
+                            f"({w_pts:.0f}x{h_pts:.0f} > {settings.MAX_PAGE_DIMENSION_POINTS} pts). Posible bomba de píxeles."
+                        )
+
                     # Rasterizar con la escala correspondiente al DPI
                     rendered_image = page.render(scale=self.render_scale).to_pil()
                     base64_uri = pil_to_base64_data_uri(rendered_image)

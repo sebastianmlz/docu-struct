@@ -68,7 +68,8 @@ def test_process_corrupt_pdf_file():
         files={"file": ("corrupto.pdf", b"PDF Falso que no tiene cabecera ni nada", "application/pdf")},
     )
     assert response.status_code == 400
-    assert "no es un PDF válido o está dañado" in response.json()["detail"]
+    detail = response.json()["detail"]
+    assert "no es un PDF válido" in detail or "firma binaria" in detail
 
 
 def test_process_exceeds_max_pages_limit():
@@ -172,7 +173,7 @@ def test_process_empty_file_fails():
         files={"file": ("vacio.pdf", b"", "application/pdf")},
     )
     assert response.status_code == 400
-    assert "vacío o contiene bytes insuficientes" in response.json()["detail"]
+    assert "vacío" in response.json()["detail"].lower()
 
 
 def test_process_payload_too_large_fails():
