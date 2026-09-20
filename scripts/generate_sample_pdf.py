@@ -8,6 +8,7 @@ Incorporates all benchmark edge cases:
 """
 
 import os
+
 from PIL import Image, ImageDraw, ImageFont
 
 PAGE_WIDTH = 1240
@@ -86,7 +87,7 @@ def generate_page_1() -> Image.Image:
     draw.rectangle([(curr_x, start_y), (curr_x + sum(col_widths), start_y + 45)], fill=(241, 245, 249))
     draw.rectangle([(curr_x, start_y), (curr_x + sum(col_widths), start_y + 45)], outline=(148, 163, 184), width=1)
 
-    for idx, (h, w) in enumerate(zip(headers, col_widths)):
+    for _idx, (h, w) in enumerate(zip(headers, col_widths, strict=True)):
         draw.text((curr_x + 12, start_y + 12), h, fill=(30, 41, 59), font=FONT_TABLE_HEAD)
         draw.line([(curr_x, start_y), (curr_x, start_y + 45)], fill=(203, 213, 225), width=1)
         curr_x += w
@@ -107,7 +108,7 @@ def generate_page_1() -> Image.Image:
         row_bg = (255, 255, 255) if r_idx % 2 == 0 else (248, 250, 252)
         draw.rectangle([(curr_x, row_y), (curr_x + sum(col_widths), row_y + 42)], fill=row_bg, outline=(226, 232, 240), width=1)
 
-        for c_idx, (val, w) in enumerate(zip(row, col_widths)):
+        for c_idx, (val, w) in enumerate(zip(row, col_widths, strict=True)):
             # Caso Censura: en la fila 2 (CTR-003), columna monto (índice 3), dibujar una barra negra de marcador
             if r_idx == 2 and c_idx == 3:
                 # Dibujar barra negra de censura realista
@@ -159,7 +160,7 @@ def generate_page_2() -> Image.Image:
     draw.rectangle([(curr_x, start_y), (curr_x + sum(col_widths), start_y + 45)], fill=(241, 245, 249))
     draw.rectangle([(curr_x, start_y), (curr_x + sum(col_widths), start_y + 45)], outline=(148, 163, 184), width=1)
 
-    for h, w in zip(headers, col_widths):
+    for h, w in zip(headers, col_widths, strict=True):
         draw.text((curr_x + 12, start_y + 12), h, fill=(30, 41, 59), font=FONT_TABLE_HEAD)
         draw.line([(curr_x, start_y), (curr_x, start_y + 45)], fill=(203, 213, 225), width=1)
         curr_x += w
@@ -179,7 +180,7 @@ def generate_page_2() -> Image.Image:
         row_bg = (255, 255, 255) if r_idx % 2 == 0 else (248, 250, 252)
         draw.rectangle([(curr_x, row_y), (curr_x + sum(col_widths), row_y + 42)], fill=row_bg, outline=(226, 232, 240), width=1)
 
-        for c_idx, (val, w) in enumerate(zip(row, col_widths)):
+        for c_idx, (val, w) in enumerate(zip(row, col_widths, strict=True)):
             # Caso Censura 2: En fila 1 (CTR-008), columna monto (índice 3), cinta correctora / barra negra
             if r_idx == 1 and c_idx == 3:
                 draw.rectangle([(curr_x + 10, row_y + 8), (curr_x + w - 15, row_y + 34)], fill=(15, 23, 42))
@@ -200,7 +201,7 @@ def generate_page_2() -> Image.Image:
     # Texto Legal de Aprobación
     text_y = row_y + 80
     draw.text((80, text_y), "DISPOSICIONES FINALES Y CONDICIONES GENERALES:", fill=(15, 23, 42), font=FONT_SECTION)
-    
+
     p_fin = (
         "1. Los adjudicatarios dispondrán de un plazo de 15 días hábiles a contar de la presente notificación para concurrir a la suscripción\n"
         "   del contrato definitivo ante la Notaría autorizada que se consigna en el Anexo 1.\n\n"
@@ -325,7 +326,7 @@ def generate_page_4() -> Image.Image:
     draw.rectangle([(curr_x, start_y), (curr_x + sum(col_widths), start_y + 45)], fill=(241, 245, 249))
     draw.rectangle([(curr_x, start_y), (curr_x + sum(col_widths), start_y + 45)], outline=(148, 163, 184), width=1)
 
-    for h, w in zip(headers, col_widths):
+    for h, w in zip(headers, col_widths, strict=True):
         draw.text((curr_x + 12, start_y + 12), h, fill=(30, 41, 59), font=FONT_TABLE_HEAD)
         draw.line([(curr_x, start_y), (curr_x, start_y + 45)], fill=(203, 213, 225), width=1)
         curr_x += w
@@ -344,7 +345,7 @@ def generate_page_4() -> Image.Image:
         row_bg = (255, 255, 255) if r_idx % 2 == 0 else (248, 250, 252)
         draw.rectangle([(curr_x, row_y), (curr_x + sum(col_widths), row_y + 42)], fill=row_bg, outline=(226, 232, 240), width=1)
 
-        for c_idx, (val, w) in enumerate(zip(row, col_widths)):
+        for c_idx, (val, w) in enumerate(zip(row, col_widths, strict=True)):
             # Censura en fila 2, columnas 1 y 3
             if r_idx == 2 and (c_idx == 1 or c_idx == 3):
                 draw.rectangle([(curr_x + 8, row_y + 8), (curr_x + w - 12, row_y + 34)], fill=(15, 23, 42))
