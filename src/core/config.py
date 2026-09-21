@@ -1,7 +1,6 @@
 """Application configuration settings managed via Pydantic Settings."""
 
 from functools import lru_cache
-import os
 
 from dotenv import load_dotenv
 from pydantic import Field, SecretStr
