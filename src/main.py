@@ -1,3 +1,5 @@
+"""Central API router aggregating all versioned endpoints."""
+
 import logging
 import time
 import uuid

@@ -1,9 +1,14 @@
 """Application configuration settings managed via Pydantic Settings."""
 
 from functools import lru_cache
+import os
 
+from dotenv import load_dotenv
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Carga variables del archivo .env a os.environ (esencial para LangChain/LangSmith tracing nativo)
+load_dotenv(override=True)
 
 
 class Settings(BaseSettings):
@@ -55,6 +60,10 @@ class Settings(BaseSettings):
         default=SecretStr(""),
         description="API Key de OpenAI.",
     )
+    OPENAI_BASE_URL: str | None = Field(
+        default=None,
+        description="URL base personalizada para APIs compatibles con OpenAI (e.g. Ollama, vLLM, LM Studio en red local).",
+    )
 
     # Restricciones de Ingesta
     MAX_UPLOAD_SIZE_MB: int = Field(
@@ -97,10 +106,16 @@ class Settings(BaseSettings):
         le=120,
         description="Límite de solicitudes de procesamiento por minuto por IP.",
     )
+    PAGE_EXTRACTION_CONCURRENCY: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Máximo de páginas de un mismo documento procesadas concurrentemente por el modelo.",
+    )
     DOCUMENT_TIMEOUT_SECONDS: int = Field(
-        default=120,
+        default=600,
         ge=10,
-        le=600,
+        le=1800,
         description="Límite de tiempo máximo en segundos para procesar un documento antes de timeout.",
     )
     STRICT_CSP_ENABLED: bool = Field(
@@ -161,8 +176,11 @@ class Settings(BaseSettings):
 
     @property
     def effective_openai_key(self) -> str:
-        """Obtiene la clave activa de OpenAI."""
-        return self.OPENAI_API_KEY.get_secret_value().strip()
+        """Obtiene la clave activa de OpenAI o una clave placeholder para endpoints locales (Ollama/vLLM)."""
+        key = self.OPENAI_API_KEY.get_secret_value().strip()
+        if not key and self.OPENAI_BASE_URL:
+            return "local-model-no-key-required"
+        return key
 
     @property
     def is_gemini_configured(self) -> bool:
@@ -170,7 +188,7 @@ class Settings(BaseSettings):
 
     @property
     def is_openai_configured(self) -> bool:
-        return bool(self.effective_openai_key)
+        return bool(self.effective_openai_key) or bool(self.OPENAI_BASE_URL)
 
     def get_provider_for_model(self, model_name: str) -> str:
         """Determina el proveedor (google u openai) según el nombre del modelo o las claves."""

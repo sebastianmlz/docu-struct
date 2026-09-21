@@ -251,3 +251,250 @@ def test_credential_and_signature_aggregation_and_deduplication():
     assert "19.333.444-5" in ids
     # Firmas acumuladas
     assert len(result.extracted_signatures) == 2
+
+
+def test_different_headers_rejected_as_independent_tables():
+    """Valida el caso crítico de PRUEBA.pdf: tablas con encabezados incompatibles no deben fusionarse verticalmente."""
+    postprocessor = DocumentPostprocessor()
+
+    table_p1 = TablePayload(
+        headers=["ID", "PRODUCTO", "NOMBRE"],
+        rows=[
+            ["1234", "AAA", "A"],
+            ["2", "BBB", "B"],
+            ["3", "CCC", "C"],
+        ],
+        split_metadata=TableSplitMetadata(
+            table_id="table_1",
+            is_continuation=False,
+            has_subsequent_continuation=False,
+        ),
+    )
+
+    # El LLM erróneamente marcó is_continuation=True hacia table_1
+    table_p2 = TablePayload(
+        headers=["PRECIO", "STOCK"],
+        rows=[
+            ["2", "1231"],
+            ["1", "12312"],
+            ["23", "124"],
+        ],
+        split_metadata=TableSplitMetadata(
+            table_id="table_1",  # Mismo ID por alucinación del LLM
+            is_continuation=True,
+            continuation_of_id="table_1",
+            split_type=TableSplitType.VERTICAL_CONTINUATION,
+            has_subsequent_continuation=False,
+        ),
+    )
+
+    p1 = PageExtraction(page_number=1, blocks=[DocumentBlock(reading_order_index=1, block_type=BlockType.TABLE, table_data=table_p1)])
+    p2 = PageExtraction(page_number=2, blocks=[DocumentBlock(reading_order_index=1, block_type=BlockType.TABLE, table_data=table_p2)])
+
+    result = postprocessor.process("doc-prueba", "PRUEBA.pdf", [p1, p2])
+
+    # Deben resultar 2 tablas separadas e independientes
+    assert len(result.unified_tables) == 2
+
+    # Tabla 1: Productos
+    t1 = result.unified_tables[0]
+    assert t1.headers == ["ID", "PRODUCTO", "NOMBRE"]
+    assert len(t1.rows) == 3
+    assert t1.rows[0] == ["1234", "AAA", "A"]
+
+    # Tabla 2: Precios y Stock (con ID único generado defensivamente)
+    t2 = result.unified_tables[1]
+    assert t2.headers == ["PRECIO", "STOCK"]
+    assert len(t2.rows) == 3
+    assert t2.rows[0] == ["2", "1231"]
+    assert t2.split_metadata.table_id != t1.split_metadata.table_id
+    assert t2.split_metadata.is_continuation is False
+
+
+def test_vertical_continuation_without_repeated_headers():
+    """Valida la continuación de una tabla cortada donde la página 2 no repite encabezados y arranca con datos."""
+    postprocessor = DocumentPostprocessor()
+
+    table_p1 = TablePayload(
+        caption="Inventario Parte 1",
+        headers=["SKU", "Descripción", "Ubicación"],
+        rows=[
+            ["A01", "Tornillo 3mm", "Estante 1"],
+            ["A02", "Tuerca 3mm", "Estante 1"],
+        ],
+        split_metadata=TableSplitMetadata(
+            table_id="t_inv",
+            has_subsequent_continuation=True,
+        ),
+    )
+
+    # La página 2 arranca directamente con filas sin encabezados reales (o inferidos Col_1, Col_2...)
+    table_p2 = TablePayload(
+        caption=None,
+        headers=["Col_1", "Col_2", "Col_3"],
+        rows=[
+            ["A03", "Arandela 3mm", "Estante 2"],
+            ["A04", "Clavo 2pulg", "Estante 3"],
+        ],
+        split_metadata=TableSplitMetadata(
+            table_id="t_inv_cont",
+            is_continuation=True,
+            continuation_of_id="t_inv",
+            split_type=TableSplitType.VERTICAL_CONTINUATION,
+        ),
+    )
+
+    p1 = PageExtraction(page_number=1, blocks=[DocumentBlock(reading_order_index=1, block_type=BlockType.TABLE, table_data=table_p1)])
+    p2 = PageExtraction(page_number=2, blocks=[DocumentBlock(reading_order_index=1, block_type=BlockType.TABLE, table_data=table_p2)])
+
+    result = postprocessor.process("doc-inv", "inventario.pdf", [p1, p2])
+
+    assert len(result.unified_tables) == 1
+    unified = result.unified_tables[0]
+    assert unified.headers == ["SKU", "Descripción", "Ubicación"]
+    assert len(unified.rows) == 4
+    assert unified.rows[2] == ["A03", "Arandela 3mm", "Estante 2"]
+    assert unified.rows[3] == ["A04", "Clavo 2pulg", "Estante 3"]
+
+
+def test_vertical_continuation_with_fuzzy_matching_headers_and_dedup():
+    """Valida fusión vertical con encabezados con tildes/espacios y deduplicación si el LLM extrajo el encabezado en row 0."""
+    postprocessor = DocumentPostprocessor()
+
+    table_p1 = TablePayload(
+        headers=["CÓDIGO", "DESCRIPCIÓN", "MONTO NETO"],
+        rows=[["C1", "Item A", "100"]],
+        split_metadata=TableSplitMetadata(table_id="t_fact", has_subsequent_continuation=True),
+    )
+
+    # Página 2 repite encabezados con pequeñas diferencias de acento/espacio
+    # y accidentalmente puso la fila de encabezados como fila 0 de rows
+    table_p2 = TablePayload(
+        headers=["codigo", "descripcion ", "monto neto"],
+        rows=[
+            ["CÓDIGO", "DESCRIPCIÓN", "MONTO NETO"],  # Fila duplicada por el OCR
+            ["C2", "Item B", "200"],
+        ],
+        split_metadata=TableSplitMetadata(
+            table_id="t_fact_p2",
+            is_continuation=True,
+            continuation_of_id="t_fact",
+            split_type=TableSplitType.VERTICAL_CONTINUATION,
+        ),
+    )
+
+    p1 = PageExtraction(page_number=1, blocks=[DocumentBlock(reading_order_index=1, block_type=BlockType.TABLE, table_data=table_p1)])
+    p2 = PageExtraction(page_number=2, blocks=[DocumentBlock(reading_order_index=1, block_type=BlockType.TABLE, table_data=table_p2)])
+
+    result = postprocessor.process("doc-fact", "factura.pdf", [p1, p2])
+
+    assert len(result.unified_tables) == 1
+    unified = result.unified_tables[0]
+    # La fila duplicada de encabezados en row 0 debe haberse omitido
+    assert len(unified.rows) == 2
+    assert unified.rows[0] == ["C1", "Item A", "100"]
+    assert unified.rows[1] == ["C2", "Item B", "200"]
+
+
+def test_multiple_independent_tables_same_page():
+    """Valida que dos tablas en la misma página sin relación se conserven de forma independiente."""
+    postprocessor = DocumentPostprocessor()
+
+    table_a = TablePayload(
+        caption="Resumen de Ventas",
+        headers=["Zona", "Ventas"],
+        rows=[["Norte", "5000"], ["Sur", "3000"]],
+        split_metadata=TableSplitMetadata(table_id="t_resumen"),
+    )
+
+    table_b = TablePayload(
+        caption="Detalle de Gastos",
+        headers=["Categoría", "Gasto"],
+        rows=[["Viáticos", "800"], ["Insumos", "1200"]],
+        split_metadata=TableSplitMetadata(table_id="t_gastos"),
+    )
+
+    p1 = PageExtraction(
+        page_number=1,
+        blocks=[
+            DocumentBlock(reading_order_index=1, block_type=BlockType.TABLE, table_data=table_a),
+            DocumentBlock(reading_order_index=2, block_type=BlockType.TABLE, table_data=table_b),
+        ],
+    )
+
+    result = postprocessor.process("doc-same-page", "reporte.pdf", [p1])
+
+    assert len(result.unified_tables) == 2
+    assert result.unified_tables[0].split_metadata.table_id == "t_resumen"
+    assert result.unified_tables[1].split_metadata.table_id == "t_gastos"
+
+
+def test_horizontal_continuation_isolated_from_older_pages_with_same_local_id():
+    """Valida que una continuación horizontal en la página 3 resuelva a la tabla de la misma página
+
+    y no se fusione erróneamente con una tabla de la página 1 que compartía el mismo ID local ('table_2').
+    """
+    postprocessor = DocumentPostprocessor()
+
+    # Página 1: table_1 e independiente table_2 (Precio y Stock)
+    p1_t1 = TablePayload(
+        headers=["ID", "PRODUCTO"],
+        rows=[["PRD-01", "Servidor"]],
+        split_metadata=TableSplitMetadata(table_id="table_1"),
+    )
+    p1_t2 = TablePayload(
+        headers=["PRECIO_USD", "STOCK_DISPONIBLE", "UBICACIÓN_BODEGA"],
+        rows=[["$ 3,450.00", "12", "Rack A"]],
+        split_metadata=TableSplitMetadata(table_id="table_2"),
+    )
+    p1 = PageExtraction(
+        page_number=1,
+        blocks=[
+            DocumentBlock(reading_order_index=1, block_type=BlockType.TABLE, table_data=p1_t1),
+            DocumentBlock(reading_order_index=2, block_type=BlockType.TABLE, table_data=p1_t2),
+        ],
+    )
+
+    # Página 3: tabla con ID local 'table_2' y continuación horizontal 'table_3' (continuation_of_id='table_2')
+    p3_t2 = TablePayload(
+        headers=["RUT", "NOMBRE", "CARGO"],
+        rows=[["15.234.887-2", "Ricardo", "Cloud"]],
+        split_metadata=TableSplitMetadata(table_id="table_2"),
+    )
+    p3_t3 = TablePayload(
+        headers=["EVAL_Q1", "EVAL_Q2", "RESULTADO_GLOBAL"],
+        rows=[["94.5%", "96.2%", "APROBADO"]],
+        split_metadata=TableSplitMetadata(
+            table_id="table_3",
+            is_continuation=True,
+            continuation_of_id="table_2",
+            split_type=TableSplitType.HORIZONTAL_CONTINUATION,
+        ),
+    )
+    p3 = PageExtraction(
+        page_number=3,
+        blocks=[
+            DocumentBlock(reading_order_index=1, block_type=BlockType.TABLE, table_data=p3_t2),
+            DocumentBlock(reading_order_index=2, block_type=BlockType.TABLE, table_data=p3_t3),
+        ],
+    )
+
+    result = postprocessor.process("doc-cross-scope", "evaluacion.pdf", [p1, p3])
+
+    # Deben existir exactamente 3 tablas unificadas:
+    # 1. p1_t1 (2 columnas)
+    # 2. p1_t2 (3 columnas) - INTOCADA, no debe tener columnas de evaluación
+    # 3. p3_t2 + p3_t3 (6 columnas: RUT, NOMBRE, CARGO, EVAL_Q1, EVAL_Q2, RESULTADO_GLOBAL)
+    assert len(result.unified_tables) == 3
+
+    # Validar tabla 2 de la página 1 intacta
+    t2_p1 = result.unified_tables[1]
+    assert t2_p1.headers == ["PRECIO_USD", "STOCK_DISPONIBLE", "UBICACIÓN_BODEGA"]
+    assert len(t2_p1.rows[0]) == 3
+
+    # Validar tabla fusionada de la página 3 con sus 6 columnas unificadas
+    t_unified_p3 = result.unified_tables[2]
+    assert t_unified_p3.headers == ["RUT", "NOMBRE", "CARGO", "EVAL_Q1", "EVAL_Q2", "RESULTADO_GLOBAL"]
+    assert len(t_unified_p3.rows[0]) == 6
+    assert t_unified_p3.rows[0] == ["15.234.887-2", "Ricardo", "Cloud", "94.5%", "96.2%", "APROBADO"]
+

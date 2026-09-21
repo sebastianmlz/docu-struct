@@ -7,6 +7,7 @@ rigorous prompt engineering for edge cases, and prompt-injection defense.
 import asyncio
 import logging
 import random
+import re
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -84,14 +85,23 @@ Tu misión es inspeccionar visualmente la imagen de la página provista y transf
   - `stamp_signature`: Firmas manuscritas (trazos de tinta), sellos o timbres circulares/rectangulares de instituciones, o pies de firma electrónica con códigos de verificación.
   - `footer_note`: Pies de página, advertencias legales de confidencialidad o numeraciones inferiores.
 
-#### CASO BORDE 2: TABLAS PARTIDAS Y CONTINUADAS (MULTI-PÁGINA)
-- Si en la página actual detectas una tabla que continúa de la página anterior (revisa el contexto previo suministrado):
-  - Marca `split_metadata.is_continuation = true`.
-  - Establece `split_metadata.continuation_of_id` con el ID de la tabla que viene continuando.
-  - Especifica `split_metadata.split_type = "vertical_continuation"` si se trata de filas adicionales que continúan la lista, o `"horizontal_continuation"` si la tabla se dividió por exceso de columnas.
-- Si una tabla llega al borde inferior de la página sin pie o sin cerrar su borde final:
-  - Marca `split_metadata.has_subsequent_continuation = true`.
-- Asigna identificadores estables y descriptivos en `table_id` (por ejemplo: "table_1", "table_2").
+#### CASO BORDE 2: TABLAS PARTIDAS, CONTINUADAS Y DISCRIMINACIÓN DE TABLAS
+- **Continuación Vertical (con o sin encabezados repetidos):**
+  - Si una tabla continúa en la página actual agregando más filas a una tabla previa:
+    - *Con encabezados repetidos:* Si la página repite los mismos encabezados (o equivalentes) que la tabla matriz previa, marca `split_metadata.is_continuation = true`, `split_metadata.continuation_of_id = <table_id_matriz>` y `split_metadata.split_type = "vertical_continuation"`.
+    - *Sin encabezados (filas desnudas):* Si una tabla previa quedó cortada al pie de página y la página actual arranca de inmediato con filas de datos sin fila de encabezado, pero con la misma cantidad y tipo de columnas, marca `split_metadata.is_continuation = true`, `split_metadata.continuation_of_id = <table_id_matriz>` y `split_metadata.split_type = "vertical_continuation"`.
+- **Continuación Horizontal (Columnas partidas / Ancho excesivo):**
+  - Si una tabla tiene demasiadas columnas y sus columnas complementarias continúan en un bloque inferior o en la página contigua (misma cantidad de filas o alineadas por fila):
+    - Marca `split_metadata.is_continuation = true`, `split_metadata.continuation_of_id = <table_id_matriz>` y `split_metadata.split_type = "horizontal_continuation"`.
+- **REGLA DE ORO DE DISCRIMINACIÓN (TABLAS INDEPENDIENTES):**
+  - Si dos tablas aparecen consecutivas (incluso sin texto intermedio que las separe) pero tienen **encabezados diferentes** y representan temas, entidades o conjuntos de datos distintos (por ejemplo, `[ID, PRODUCTO, NOMBRE]` vs `[PRECIO, STOCK]`, o tabla de clientes vs tabla de órdenes):
+    - **SON TABLAS INDEPENDIENTES.**
+    - Asigna identificadores distintos y unívocos (`table_1`, `table_2`, etc.).
+    - Establece obligatoriamente: `is_continuation = false`, `continuation_of_id = null`, `split_type = "none"`.
+    - **PROHIBIDO:** NUNCA clasifiques como continuación una tabla cuyos encabezados o conceptos sean disonantes de la tabla previa.
+- **Tablas que continúan en la siguiente página:**
+  - Si una tabla llega al borde inferior de la página cortándose sin pie o borde de cierre:
+    - Marca `split_metadata.has_subsequent_continuation = true`.
 
 #### CASO BORDE 3: MANEJO RIGUROSO DE DATOS CENSURADOS Y TACHADOS
 - Detecta activamente trazos de marcador negro, barras de censura, papel blanco superpuesto, cinta correctora o campos deliberadamente tachados o borroneados.
@@ -158,8 +168,12 @@ class VisionExtractorService:
             "model": self.model_name,
             "api_key": settings.effective_openai_key,
             "max_retries": 2,
-            "timeout": 120,
+            "timeout": settings.DOCUMENT_TIMEOUT_SECONDS,
         }
+
+        if settings.OPENAI_BASE_URL:
+            kwargs["base_url"] = settings.OPENAI_BASE_URL
+            logger.info("Conectando con endpoint local/personalizado OpenAI en: %s", settings.OPENAI_BASE_URL)
 
         # Modelos con capacidad de razonamiento adaptativo (gpt-5.6-terra, o1, o3) aceptan reasoning_effort
         is_reasoning_model = any(
@@ -188,17 +202,26 @@ class VisionExtractorService:
     ) -> list[Any]:
         """Ensambla los mensajes multimodales (System + Human con imagen Base64)."""
         context_str = "No hay contexto previo (esta es la primera página o no hubo elementos continuados)."
-        if context and (context.unclosed_tables or context.last_block_type):
-            tables_summary = []
-            for t in context.unclosed_tables:
-                tables_summary.append(
-                    f"- Tabla ID '{t.split_metadata.table_id}' con headers {t.headers} (quedó abierta en página {context.previous_page_number})"
+        if context:
+            if context.unclosed_tables:
+                tables_summary = []
+                for t in context.unclosed_tables:
+                    tables_summary.append(
+                        f"- Tabla ID '{t.split_metadata.table_id}' con headers {t.headers} (quedó abierta en página {context.previous_page_number}). "
+                        f"Si la primera tabla de esta página continúa estas filas o columnas, vincúlala con is_continuation=true y continuation_of_id='{t.split_metadata.table_id}'."
+                    )
+                context_str = (
+                    f"Contexto heredado de la página {context.previous_page_number} (TABLAS PENDIENTES DE CERRAR):\n"
+                    + "\n".join(tables_summary)
                 )
-            context_str = (
-                f"Contexto heredado de la página {context.previous_page_number}:\n"
-                + "\n".join(tables_summary)
-                + (f"\nÚltimo tipo de bloque previo: {context.last_block_type}" if context.last_block_type else "")
-            )
+            else:
+                context_str = (
+                    f"Contexto de página {context.previous_page_number}: Todas las tablas de la página previa quedaron formalmente CERRADAS.\n"
+                    f"Toda tabla encontrada en esta página debe clasificarse por defecto como NUEVA e INDEPENDIENTE (is_continuation=false, table_id nuevo), "
+                    f"a menos que sea inequívocamente una continuación evidente de la misma estructura."
+                )
+            if context.last_block_type and context.last_block_type != "table":
+                context_str += f"\nÚltimo tipo de bloque previo: {context.last_block_type}"
 
         user_prompt_text = (
             f"Analiza la siguiente imagen correspondiente a la PÁGINA {page_number} de un total de {total_pages} páginas.\n\n"
@@ -298,11 +321,19 @@ class VisionExtractorService:
 
                 if is_transient and attempt < max_attempts:
                     telemetry_registry.record_model_retry()
-                    base_backoff = attempt * 2.0
-                    jitter = random.uniform(0.75, 1.25)  # nosec B311
-                    backoff = round(base_backoff * jitter, 2)
+
+                    # Verificar si el proveedor solicitó un tiempo de espera explícito (e.g. retryDelay de Google/OpenAI)
+                    retry_match = re.search(r"retry\s*(?:in\s*|delay'?:\s*'?)([\d\.]+)\s*s", err_str)
+                    if retry_match:
+                        retry_delay = float(retry_match.group(1)) + 1.0
+                        backoff = min(retry_delay, 60.0)
+                    else:
+                        base_backoff = (2**attempt) * 1.5
+                        jitter = random.uniform(0.8, 1.2)  # nosec B311
+                        backoff = round(base_backoff * jitter, 2)
+
                     logger.warning(
-                        "Respuesta transitoria del proveedor de IA en página %d (%s). Reintento %d/%d con jitter en %.2fs...",
+                        "Respuesta transitoria del proveedor de IA en página %d (%s). Reintento %d/%d tras %.2fs...",
                         page_number,
                         exc,
                         attempt,

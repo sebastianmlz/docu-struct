@@ -24,7 +24,6 @@ from src.schemas.api_response import (
     ProcessingMetrics,
     ProcessingStatus,
 )
-from src.schemas.document import BlockType
 from src.services.pdf_converter import (
     CorruptPDFError,
     EmptyPDFError,
@@ -36,7 +35,6 @@ from src.services.postprocessor import DocumentPostprocessor
 from src.services.vision_extractor import (
     ExtractionModelError,
     OpenAIConfigurationError,
-    PreviousPageContext,
     VisionExtractorService,
 )
 
@@ -156,38 +154,30 @@ async def process_document(
         pdf_converter = PDFConverterService()
         rendered_doc = pdf_converter.convert(pdf_bytes)
 
-        # B. Inferencia Multimodal: Extracción secuencial con contexto inter-página
+        # B. Inferencia Multimodal: Extracción concurrente de páginas (Anti-Bottleneck)
         vision_service = VisionExtractorService()
-        page_extractions = []
-        context: PreviousPageContext | None = None
+        # Semáforo para controlar concurrencia de llamadas LLM por documento
+        page_sem = asyncio.Semaphore(settings.PAGE_EXTRACTION_CONCURRENCY)
 
-        for page in rendered_doc.pages:
-            logger.info("Enviando página %d/%d al modelo multimodal", page.page_number, rendered_doc.total_pages)
-            page_result = await vision_service.aextract_page(
-                image_base64_uri=page.image_base64_uri,
-                page_number=page.page_number,
-                total_pages=rendered_doc.total_pages,
-                context=context,
-            )
-            page_extractions.append(page_result)
+        async def _extract_single_page(page):
+            async with page_sem:
+                logger.info(
+                    "Enviando página %d/%d al modelo multimodal (concurrente)",
+                    page.page_number,
+                    rendered_doc.total_pages,
+                )
+                return await vision_service.aextract_page(
+                    image_base64_uri=page.image_base64_uri,
+                    page_number=page.page_number,
+                    total_pages=rendered_doc.total_pages,
+                    context=None,
+                    max_attempts=4,
+                )
 
-            # Extraer tablas no cerradas para inyectarlas como contexto en la página siguiente
-            unclosed_tables = [
-                b.table_data
-                for b in page_result.blocks
-                if b.block_type == BlockType.TABLE
-                and b.table_data is not None
-                and b.table_data.split_metadata.has_subsequent_continuation
-            ]
-            last_block_type = (
-                page_result.blocks[-1].block_type.value if page_result.blocks else None
-            )
-
-            context = PreviousPageContext(
-                previous_page_number=page.page_number,
-                unclosed_tables=unclosed_tables,
-                last_block_type=last_block_type,
-            )
+        raw_extractions = await asyncio.gather(
+            *[_extract_single_page(p) for p in rendered_doc.pages]
+        )
+        page_extractions = sorted(raw_extractions, key=lambda p: p.page_number)
 
         # C. Postprocesamiento y Reconciliación Determinista
         postprocessor = DocumentPostprocessor()

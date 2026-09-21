@@ -6,6 +6,8 @@ blocks (credentials, signatures, metadata), and evaluates document-wide censorsh
 
 import copy
 import logging
+import re
+import unicodedata
 
 from src.schemas.document import (
     CENSORED_SENTINEL,
@@ -20,6 +22,24 @@ from src.schemas.document import (
 )
 
 logger = logging.getLogger("docustruct.postprocessor")
+
+
+def _normalize_header_token(text: str | None) -> str:
+    """Normaliza un encabezado para comparación insensible a mayúsculas, espacios y acentos."""
+    if not text:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", str(text))
+    clean = "".join([c for c in nfkd if not unicodedata.combining(c)])
+    clean = re.sub(r"[^\w\s]", "", clean.lower()).strip()
+    return re.sub(r"\s+", " ", clean)
+
+
+def _is_generic_header(header: str | None) -> bool:
+    """Detecta si un encabezado es genérico o inferido (e.g. 'col_1', 'columna 2', 'campo 3', '')."""
+    norm = _normalize_header_token(header)
+    if not norm:
+        return True
+    return bool(re.match(r"^(col|columna|column|campo|field|c)?_?\d+$", norm))
 
 
 class DocumentPostprocessor:
@@ -78,73 +98,281 @@ class DocumentPostprocessor:
 
         return result
 
+    @classmethod
+    def _can_stitch_vertical(
+        cls, parent: TablePayload, child: TablePayload
+    ) -> tuple[bool, str]:
+        """Evalúa deterministamente si la tabla hija puede ser una continuación vertical legítima del padre."""
+        parent_cols = len(parent.headers)
+        child_cols = len(child.headers)
+        child_row_cols = len(child.rows[0]) if child.rows else child_cols
+
+        parent_norm = [_normalize_header_token(h) for h in parent.headers]
+        child_norm = [_normalize_header_token(h) for h in child.headers]
+
+        child_has_no_real_headers = not child.headers or all(
+            _is_generic_header(h) for h in child.headers
+        )
+
+        # Caso 1: La tabla hija tiene encabezados explícitos sustanciales
+        if not child_has_no_real_headers:
+            # A. Identidad exacta o normalizada
+            if parent_norm == child_norm:
+                return True, "Encabezados idénticos en ambas tablas"
+
+            # B. Misma cantidad de columnas y coincidencia léxica alta (>= 50%)
+            if parent_cols > 0 and parent_cols == child_cols:
+                matching_count = sum(
+                    1
+                    for p, c in zip(parent_norm, child_norm, strict=True)
+                    if p and c and (p == c or p in c or c in p)
+                )
+                if (matching_count / parent_cols) >= 0.5:
+                    return True, f"Encabezados coincidentes ({matching_count}/{parent_cols} columnas)"
+
+            # C. Encabezados por conjunto de tokens (orden ligeramente alterado pero mismos conceptos)
+            parent_set = {t for t in parent_norm if t and not _is_generic_header(t)}
+            child_set = {t for t in child_norm if t and not _is_generic_header(t)}
+            if parent_set and child_set:
+                overlap = parent_set.intersection(child_set)
+                overlap_ratio = len(overlap) / max(len(parent_set), len(child_set))
+                if overlap_ratio >= 0.6:
+                    return True, f"Conjunto de encabezados coincidente (ratio: {overlap_ratio:.2f})"
+
+            # Si tiene encabezados reales pero son sustancialmente disonantes (e.g. ID, PRODUCTO vs PRECIO, STOCK)
+            return (
+                False,
+                f"Encabezados disonantes incompatibles con continuación vertical: "
+                f"padre={parent.headers} vs hijo={child.headers}",
+            )
+
+        # Caso 2: La tabla hija NO tiene encabezados reales (arranca directamente con filas de datos)
+        if child.rows:
+            if child_row_cols == parent_cols and (
+                parent.split_metadata.has_subsequent_continuation
+                or child.split_metadata.is_continuation
+            ):
+                return (
+                    True,
+                    f"Continuación sin encabezados repetidos (misma cantidad de columnas: {parent_cols})",
+                )
+            return (
+                False,
+                f"Cantidad de columnas en filas ({child_row_cols}) no coincide con tabla matriz ({parent_cols})",
+            )
+
+        # Caso de borde: hijo vacío sin filas ni encabezados
+        return False, "Tabla hija sin filas ni encabezados válidos para continuación"
+
+    @classmethod
+    def _can_stitch_horizontal(
+        cls, parent: TablePayload, child: TablePayload
+    ) -> tuple[bool, str]:
+        """Evalúa si la tabla hija corresponde a columnas adicionales (tabla ancha dividida horizontalmente)."""
+        if child.split_metadata.split_type != TableSplitType.HORIZONTAL_CONTINUATION:
+            return (
+                False,
+                f"split_type no es horizontal_continuation (es '{child.split_metadata.split_type}')",
+            )
+
+        # Si ambas tienen filas, la cantidad debe ser compatible (permitiendo ligera variación por subtotales)
+        if parent.rows and child.rows:
+            diff = abs(len(parent.rows) - len(child.rows))
+            if diff <= 1 or len(child.rows) <= len(parent.rows):
+                return (
+                    True,
+                    f"Filas compatibles para fusión horizontal (padre: {len(parent.rows)}, hijo: {len(child.rows)})",
+                )
+            return (
+                False,
+                f"Discrepancia excesiva de filas para división horizontal ({len(parent.rows)} vs {len(child.rows)})",
+            )
+
+        return True, "Estructura válida para fusión horizontal"
+
     def _reconcile_tables(self, pages: list[PageExtraction]) -> list[TablePayload]:
         """Reconstruye tablas partidas vertical u horizontalmente a lo largo de las páginas."""
         consolidated: list[TablePayload] = []
         table_map: dict[str, TablePayload] = {}
+        table_page_map: dict[str, int] = {}
         last_table_seen: TablePayload | None = None
+        last_table_page: int | None = None
+
+        # Mapeos locales por página: (page_number, raw_table_id) -> canonical_id
+        # Resuelve continuation_of_id en el ámbito local de la página correspondiente
+        page_local_to_canonical: dict[int, dict[str, str]] = {}
 
         # Ordenar páginas por número para procesar secuencialmente
         sorted_pages = sorted(pages, key=lambda p: p.page_number)
 
         for page in sorted_pages:
+            p_num = page.page_number
+            page_local_to_canonical[p_num] = {}
+
             table_blocks = [
                 b for b in sorted(page.blocks, key=lambda b: b.reading_order_index)
                 if b.block_type == BlockType.TABLE and b.table_data is not None
             ]
 
-            for block in table_blocks:
+            for block_idx, block in enumerate(table_blocks, start=1):
                 current_table = copy.deepcopy(block.table_data)
                 meta = current_table.split_metadata
+                raw_table_id = meta.table_id
 
-                # Caso 1: La tabla indica explícitamente ser continuación
                 target_parent: TablePayload | None = None
 
+                # Candidato 1: La tabla indica explícitamente ser continuación
                 if meta.is_continuation and meta.continuation_of_id:
-                    target_parent = table_map.get(meta.continuation_of_id)
+                    cid = meta.continuation_of_id
 
-                # Heurística de Resiliencia: Si es continuación pero continuation_of_id falló,
-                # o si la tabla anterior quedó con has_subsequent_continuation=True
+                    # 1a. Buscar primero en la MISMA página (e.g. división horizontal intra-página)
+                    if cid in page_local_to_canonical[p_num]:
+                        canon_id = page_local_to_canonical[p_num][cid]
+                        target_parent = table_map.get(canon_id)
+
+                    # 1b. Si no está en la misma página, buscar en la página inmediatamente anterior (P-1)
+                    if (
+                        target_parent is None
+                        and (p_num - 1) in page_local_to_canonical
+                        and cid in page_local_to_canonical[p_num - 1]
+                    ):
+                        canon_id = page_local_to_canonical[p_num - 1][cid]
+                        target_parent = table_map.get(canon_id)
+
+                    # 1c. Búsqueda global en table_map sólo si el candidato está a distancia válida
+                    if target_parent is None:
+                        candidate = table_map.get(cid)
+                        if candidate is not None:
+                            parent_page = table_page_map.get(cid, p_num)
+                            page_diff = abs(p_num - parent_page)
+                            # Sólo permitir candidatos en la misma página o contigua (diff <= 1)
+                            if page_diff <= 1:
+                                target_parent = candidate
+
+                # Candidato 2: Heurística de Resiliencia si continuation_of_id no coincidió o faltó
                 if (
                     target_parent is None
                     and last_table_seen is not None
                     and (meta.is_continuation or last_table_seen.split_metadata.has_subsequent_continuation)
-                    and len(last_table_seen.headers) == len(current_table.headers)
                 ):
-                    target_parent = last_table_seen
-                    logger.info(
-                        "Heurística de reconciliación: asociando tabla '%s' como continuación de '%s'",
-                        meta.table_id,
-                        last_table_seen.split_metadata.table_id,
-                    )
+                    page_diff = p_num - (last_table_page or p_num)
+                    if page_diff <= 1:
+                        can_v_pre, _ = self._can_stitch_vertical(last_table_seen, current_table)
+                        can_h_pre, _ = self._can_stitch_horizontal(last_table_seen, current_table)
+                        if can_v_pre or can_h_pre:
+                            target_parent = last_table_seen
+                            logger.info(
+                                "Heurística de reconciliación: asociando tabla '%s' como candidata de '%s'",
+                                meta.table_id,
+                                last_table_seen.split_metadata.table_id,
+                            )
 
-                # Si encontramos la tabla matriz a continuar
+                # Si tenemos un padre candidato, validar estrictamente la compatibilidad
+                reconciled = False
                 if target_parent is not None:
-                    if meta.split_type == TableSplitType.HORIZONTAL_CONTINUATION:
-                        self._stitch_horizontal(target_parent, current_table)
-                    else:
-                        # Por defecto vertical (filas continuadas)
-                        self._stitch_vertical(target_parent, current_table)
+                    parent_id = target_parent.split_metadata.table_id
+                    parent_page = table_page_map.get(parent_id, p_num)
+                    page_diff = abs(p_num - parent_page)
 
-                    # Actualizar estado de si la tabla continuará aún más
-                    target_parent.split_metadata.has_subsequent_continuation = (
-                        meta.has_subsequent_continuation
-                    )
-                    last_table_seen = target_parent
-                else:
+                    if meta.split_type == TableSplitType.HORIZONTAL_CONTINUATION:
+                        if page_diff > 1:
+                            logger.warning(
+                                "Reconciliación horizontal rechazada entre '%s' (pág %d) y '%s' (pág %d): páginas no consecutivas",
+                                meta.table_id,
+                                p_num,
+                                parent_id,
+                                parent_page,
+                            )
+                        else:
+                            can_h, reason_h = self._can_stitch_horizontal(target_parent, current_table)
+                            if can_h:
+                                self._stitch_horizontal(target_parent, current_table)
+                                target_parent.split_metadata.has_subsequent_continuation = (
+                                    meta.has_subsequent_continuation
+                                )
+                                last_table_seen = target_parent
+                                last_table_page = p_num
+                                reconciled = True
+                                page_local_to_canonical[p_num][raw_table_id] = parent_id
+                                logger.info(
+                                    "Reconciliación horizontal exitosa: tabla '%s' integrada en '%s'",
+                                    meta.table_id,
+                                    parent_id,
+                                )
+                            else:
+                                logger.warning(
+                                    "Reconciliación horizontal rechazada entre '%s' y '%s': %s",
+                                    meta.table_id,
+                                    parent_id,
+                                    reason_h,
+                                )
+                    else:
+                        can_v, reason_v = self._can_stitch_vertical(target_parent, current_table)
+                        if can_v:
+                            self._stitch_vertical(target_parent, current_table)
+                            target_parent.split_metadata.has_subsequent_continuation = (
+                                meta.has_subsequent_continuation
+                            )
+                            last_table_seen = target_parent
+                            last_table_page = p_num
+                            reconciled = True
+                            page_local_to_canonical[p_num][raw_table_id] = parent_id
+                            logger.info(
+                                "Reconciliación vertical exitosa: tabla '%s' integrada en '%s'",
+                                meta.table_id,
+                                parent_id,
+                            )
+                        else:
+                            logger.warning(
+                                "Reconciliación vertical rechazada entre '%s' y '%s': %s. Se tratará como tabla independiente.",
+                                meta.table_id,
+                                parent_id,
+                                reason_v,
+                            )
+
+                if not reconciled:
                     # Es una tabla nueva e independiente
+                    meta.is_continuation = False
+                    meta.continuation_of_id = None
+                    meta.split_type = TableSplitType.NONE
+
+                    # Resolver colisiones de table_id si el ID ya existe en table_map
+                    if meta.table_id in table_map:
+                        unique_id = f"{meta.table_id}_p{p_num}_b{block_idx}"
+                        counter = 2
+                        while unique_id in table_map:
+                            unique_id = f"{meta.table_id}_p{p_num}_b{block_idx}_{counter}"
+                            counter += 1
+                        logger.info(
+                            "Resolviendo colisión de table_id: reasignando '%s' a '%s'",
+                            meta.table_id,
+                            unique_id,
+                        )
+                        meta.table_id = unique_id
+
                     consolidated.append(current_table)
                     table_map[meta.table_id] = current_table
+                    table_page_map[meta.table_id] = p_num
+                    page_local_to_canonical[p_num][raw_table_id] = meta.table_id
                     last_table_seen = current_table
+                    last_table_page = p_num
 
         return consolidated
 
     @staticmethod
     def _stitch_vertical(parent: TablePayload, child: TablePayload) -> None:
-        """Fusiona filas continuadas asegurando alineación de columnas."""
+        """Fusiona filas continuadas asegurando alineación de columnas y deduplicando cabeceras accidentales."""
         target_col_count = len(parent.headers)
+        parent_norm = [_normalize_header_token(h) for h in parent.headers]
 
-        for row in child.rows:
+        for idx, row in enumerate(child.rows):
+            # Detección defensiva: si el LLM incluyó la fila de encabezados como primera fila de datos
+            if idx == 0 and len(row) == len(parent_norm):
+                row_norm = [_normalize_header_token(c) for c in row]
+                if row_norm == parent_norm and any(row_norm):
+                    logger.debug("Omitiendo fila 0 de datos de tabla hija por ser encabezado duplicado idéntico")
+                    continue
+
             # Si el hijo tiene menos celdas que columnas, rellenar con None
             if len(row) < target_col_count:
                 padded_row = row + [None] * (target_col_count - len(row))

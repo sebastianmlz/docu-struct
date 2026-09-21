@@ -50,3 +50,11 @@ temp/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Archivos pdf y documentos
+*.pdf
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
